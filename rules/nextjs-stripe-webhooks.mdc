@@ -1,0 +1,48 @@
+---
+description: Stripe payments and subscriptions in Next.js, covering Checkout, raw-body webhook signature checks, idempotent event handling, subscription access gating, the Customer Portal and local replay with the Stripe CLI
+globs: **/stripe/**,**/billing/**,**/*webhook*/**,**/pricing/**,**/checkout/**
+alwaysApply: false
+---
+
+# Next.js + Stripe (Checkout and webhooks)
+
+## Client and keys
+- Create the Stripe client lazily in a server-only module (for example `getStripe()` in `lib/stripe.ts`) so builds don't fail without keys. `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are server only.
+- Don't set or change `apiVersion` unless the project already pins one. The SDK's default matches its types.
+- Price ids live in server env vars or a server-side plans file (`STRIPE_PRO_PRICE_ID`). The client sends a plan key; the server maps it to a price. Never accept a price id or amount from the request body.
+
+## Checkout
+- Create Checkout Sessions in a Server Action or route handler after checking the user is signed in. Set `client_reference_id` (or `metadata.userId`) to your user id and pass the saved `customer` id when the user already has one.
+- `success_url` is for UX only. Never grant access there. Access changes come from the webhook.
+- Build redirect URLs from a server-side env var such as `APP_URL`, not from the request's `Origin` or `Host` header.
+
+## Webhook: verify the raw body
+- Use one route handler, for example `app/api/stripe/webhook/route.ts`, exporting `POST`. Read the body once with `const body = await req.text()`. Never call `req.json()` (or parse and re-stringify) before verifying: any change to the bytes breaks the signature.
+- Read the header with `req.headers.get("stripe-signature")`. If it's missing, return 400 without touching the database.
+- Verify with `stripe.webhooks.constructEvent(body, signature, process.env.STRIPE_WEBHOOK_SECRET!)` inside `try`/`catch`. On failure return 400 and log only the error message, never the body.
+- Keep the handler on the Node.js runtime (the default). Don't add `export const runtime = "edge"` to it.
+- Exclude the webhook path from auth redirects, locale rewrites and trailing-slash redirects in `proxy.ts` / `middleware.ts` and `next.config`. Stripe doesn't follow 3xx redirects, and a 401 or 404 from your auth layer counts as a failed delivery.
+
+## Webhook: one secret per endpoint and mode
+- Every webhook endpoint has its own `whsec_...` signing secret. The one printed by `stripe listen` is only for local forwarding. Each Dashboard endpoint (staging, production) has a different one. Set `STRIPE_WEBHOOK_SECRET` separately in each environment and never copy one environment's value into another.
+- Test mode and live mode are separate: `sk_test_` keys go with a test-mode endpoint's secret, `sk_live_` keys with a live endpoint's secret. Never mix a test key with a live secret or the other way round, and never commit live keys.
+- When you add or rename a webhook env var, add it to `.env.example` with a comment saying where the value comes from (`stripe listen` locally, Dashboard > Developers > Webhooks in production).
+- In production, make sure the endpoint is subscribed to every event type the handler switches on. Unsubscribed events are never sent.
+
+## Webhook: idempotency and event order
+- Stripe delivers events at least once and doesn't guarantee order. A retried or resent event has the same `event.id`.
+- Record each processed `event.id` in a table with a unique constraint. Insert it in the same transaction as the state change. If the insert hits the unique constraint, the event was already handled: return 200 and do nothing else.
+- Don't trust the order events arrive in, and don't write state straight from `event.data.object`. Take the object id, re-fetch it (`stripe.subscriptions.retrieve(id)`, `stripe.checkout.sessions.retrieve(id)`) and save what Stripe says now. Then an older event that arrives late can't overwrite newer state.
+- Return 2xx once the event is stored or handled. Do slow work (emails, provisioning) after you record the event, or in a background job, so the response isn't late. Throw or return 5xx only when you want Stripe to retry.
+- Handle at least `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted` and `invoice.payment_failed`, and sync your database from the re-fetched subscription.
+
+## Subscriptions and access
+- Your database mirrors Stripe: store the customer id, subscription id, status, price id and current period end (on newer API versions the period fields live on the subscription item). Only the webhook sync writes these fields.
+- Gate paid features on the server by reading the stored status (`active` or `trialing`), never from a client flag or query string.
+- Send users to the Customer Portal (`stripe.billingPortal.sessions.create`) for plan changes, cancellation, payment methods and invoices instead of building that UI.
+
+## Testing and local replay
+- Use test-mode keys locally and in previews. Live keys only exist in the production environment.
+- Run `stripe listen --forward-to localhost:3000/api/stripe/webhook`, put the `whsec_...` it prints in `.env.local`, restart the dev server, then fire a test event with `stripe trigger checkout.session.completed` (or `customer.subscription.updated`, `invoice.payment_failed`).
+- Replay a specific event with `stripe events resend evt_...` while `stripe listen` is running. Run it twice to confirm a duplicate is skipped.
+- A billing change is done when `stripe listen` shows `[200]` for every event, the database row changed once, and the second resend changed nothing.
